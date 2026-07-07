@@ -2,6 +2,7 @@
 // server.cpp
 // TCP 聊天室服务器 — 接受客户端连接，通过长度前缀分帧的 Protocol 消息
 // 处理注册、登录、公聊、私聊、在线用户列表，维护在线用户状态。
+// 使用读写锁保护全局用户表。
 //
 // 用法：
 //   compile:  cmake -B build && cmake --build build
@@ -22,41 +23,34 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <shared_mutex>
 #include <thread>
+#include <vector>
 
 // ---------- 全局用户表 ----------
 
 // 所有用户的注册信息和在线状态，大小固定为 MAX_USER_NUM
 std::array<OnlineUser, MAX_USER_NUM> online{};
 
-// ---------- 用户查找辅助函数 ----------
+// 读写锁：保护 online[] 的多线程并发访问
+// - shared_lock 用于纯读操作（handle_broadcast, broadcast_system_msg 等）
+// - unique_lock 用于写操作（handle_register, find_user_online, del_user_online）
+std::shared_mutex online_mutex;
 
-//
-// @brief  按用户名查找已注册用户。
-// @param  name  要搜索的用户名。
-// @return 在 online[] 中的下标，未找到返回 -1。
-//
-int find_user(const char* name) {
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        // 仅检查已注册的槽位（flag == 1）
-        if (online[i].flag == 1 && std::strcmp(name, online[i].name) == 0)
-            return i;
-    }
-    return -1;
-}
+// ---------- 用户查找辅助函数 ----------
 
 //
 // @brief  按用户名查找在线用户。
 //
-// 与 find_user() 不同，本函数要求目标用户必须在线（fd != -1）。
-// 用于私聊时查找消息接收方。
+// 要求目标用户必须在线（fd != -1），用于私聊时查找消息接收方。
+// 调用者已持有 online_mutex 的 shared_lock 或 unique_lock。
 //
 // @param  name  要搜索的用户名。
-// @return 在 online[] 中的下标，未找到（不存在或不在线）返回 -1。
+// @return 在 online[] 中的下标，未找到返回 -1。
 //
 int find_user_by_name(const char* name) {
     for (int i = 0; i < MAX_USER_NUM; ++i) {
-        // 跳过空槽位、未注册条目和不在线的用户
         if (online[i].flag != 1 || online[i].fd == -1)
             continue;
         if (std::strcmp(name, online[i].name) == 0)
@@ -65,90 +59,35 @@ int find_user_by_name(const char* name) {
     return -1;
 }
 
-//
-// @brief  验证登录凭据并标记用户上线。
-//
-// 遍历在线用户表，匹配用户名和密码。匹配成功后检查是否已在线：
-// - 未在线：记录 socket fd，标记上线
-// - 已在线：拒绝重复登录
-//
-// @param  sockfd   客户端的 socket fd。
-// @param  index    [输出] 成功时设为该用户在 online[] 中的下标。
-// @param  username 用户名。
-// @param  password 密码。
-// @return OP_OK 登录成功，USER_LOGED 已在线，NAME_PWD_NMATCH 凭据不匹配。
-//
-int find_user_online(int sockfd, int* index, const char* username,
-                     const char* password) {
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        // 跳过空槽位和未注册的条目
-        if (online[i].flag != 1)
-            continue;
-
-        // 比对用户名和密码
-        if (std::strcmp(username, online[i].name) == 0 &&
-            std::strcmp(password, online[i].passwd) == 0) {
-            // 用户名密码匹配 — 检查是否已在线
-            if (online[i].fd == -1) {
-                online[i].fd = sockfd;   // 绑定当前 socket
-                online[i].last_active = time(nullptr);  // 初始化活跃时间
-                *index = i;
-                return OP_OK;
-            } else {
-                std::cout << online[i].name << " 已在线，拒绝重复登录\n";
-                return USER_LOGED;
-            }
-        }
-    }
-    // 遍历完所有条目仍未匹配
-    return NAME_PWD_NMATCH;
-}
-
-//
-// @brief  添加新用户注册条目。
-//
-// 在 online[] 中寻找第一个空槽位并填入注册信息。
-//
-// @param  username  用户名。
-// @param  password  密码。
-// @return 新条目的下标，表满时返回 -1。
-//
-int add_user(const char* username, const char* password) {
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        // 找到第一个空槽位（flag == -1）
-        if (online[i].flag == -1) {
-            online[i].flag = 1;
-            std::strncpy(online[i].name, username, sizeof(online[i].name) - 1);
-            std::strncpy(online[i].passwd, password, sizeof(online[i].passwd) - 1);
-            std::cout << "注册 " << username << " 到槽位 " << i << '\n';
-            return i;
-        }
-    }
-    return -1;
-}
-
 // 前置声明
 void del_user_online(int index);
+void broadcast_system_msg(const char* text);
 
 // ---------- 系统通知广播 ----------
 
 //
 // @brief  向所有在线用户广播一条系统消息。
 //
-// 用于通知用户上线/离线等事件。
+// 持共享锁拷贝 fd 列表，解锁后发送（锁内不做 I/O）。
 //
 // @param  text  要广播的文本。
 //
 void broadcast_system_msg(const char* text) {
+    // 持锁拷贝在线 fd 列表
+    std::vector<int> fds;
+    {
+        std::shared_lock lock(online_mutex);
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].fd != -1)
+                fds.push_back(online[i].fd);
+        }
+    }
+
+    // 锁外发送
     Protocol hdr{};
     hdr.data_len = std::strlen(text);
-
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        if (online[i].fd == -1)
-            continue;
-        // 纯发送，失败不清理 — 死连接由 handle_broadcast 或 watchdog 处理
-        send_message(online[i].fd, hdr, text);
-    }
+    for (int fd : fds)
+        send_message(fd, hdr, text);
 }
 
 // ---------- 命令处理函数 ----------
@@ -156,7 +95,7 @@ void broadcast_system_msg(const char* text) {
 //
 // @brief  处理注册命令（REGISTE）。
 //
-// 先检查用户名是否已存在：不存在则添加，存在则返回 NAME_EXIST。
+// 持独占锁完成 find + add 操作，解锁后发送响应（锁内不做 I/O）。
 //
 // @param  sockfd  客户端 socket fd。
 // @param  index   [输出] 成功时记录该用户在 online[] 中的下标。
@@ -168,18 +107,39 @@ void handle_register(int sockfd, int* index, const Protocol& hdr,
     Protocol resp{};
     resp.cmd = REGISTE;
 
-    // 查找用户名是否已被注册
-    int dest = find_user(hdr.name);
-    if (dest == -1) {
-        // 用户名可用 — 添加到用户表
-        *index = add_user(hdr.name, data.c_str());
-        resp.state = OP_OK;
-        std::cout << "用户 " << hdr.name << " 注册成功\n";
-    } else {
-        // 用户名已被占用
-        resp.state = NAME_EXIST;
-        std::cout << "用户 " << hdr.name << " 已存在\n";
-    }
+    {
+        std::unique_lock lock(online_mutex);
+
+        // 查找用户名是否已被注册
+        int dest = -1;
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].flag == 1 && std::strcmp(hdr.name, online[i].name) == 0) {
+                dest = i;
+                break;
+            }
+        }
+
+        if (dest == -1) {
+            // 用户名可用 — 添加到用户表
+            int slot = -1;
+            for (int i = 0; i < MAX_USER_NUM; ++i) {
+                if (online[i].flag == -1) {
+                    online[i].flag = 1;
+                    std::strncpy(online[i].name, hdr.name, sizeof(online[i].name) - 1);
+                    std::strncpy(online[i].passwd, data.c_str(),
+                                 sizeof(online[i].passwd) - 1);
+                    slot = i;
+                    break;
+                }
+            }
+            *index = slot;
+            resp.state = (slot >= 0) ? OP_OK : NAME_EXIST;
+            std::cout << "用户 " << hdr.name << " 注册" << (slot >= 0 ? "成功" : "失败（表满）") << '\n';
+        } else {
+            resp.state = NAME_EXIST;
+            std::cout << "用户 " << hdr.name << " 已存在\n";
+        }
+    }  // 解锁
 
     if (!send_message(sockfd, resp))
         perror("发送注册响应失败");
@@ -200,27 +160,51 @@ void handle_login(int sockfd, int* index, const Protocol& hdr,
                   const std::string& data) {
     Protocol resp{};
     resp.cmd = LOGIN;
+    bool success = false;
 
-    // 调用凭据验证函数
-    int ret = find_user_online(sockfd, index, hdr.name, data.c_str());
-    if (ret == OP_OK) {
-        resp.state = OP_OK;
+    {
+        std::unique_lock lock(online_mutex);
+
+        int ret = NAME_PWD_NMATCH;
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].flag != 1)
+                continue;
+            if (std::strcmp(hdr.name, online[i].name) == 0 &&
+                std::strcmp(data.c_str(), online[i].passwd) == 0) {
+                if (online[i].fd == -1) {
+                    online[i].fd = sockfd;
+                    online[i].last_active = time(nullptr);
+                    *index = i;
+                    ret = OP_OK;
+                } else {
+                    std::cout << online[i].name << " 已在线，拒绝重复登录\n";
+                    ret = USER_LOGED;
+                }
+                break;
+            }
+        }
+        resp.state = ret;
+
+        if (ret == OP_OK) {
+            success = true;
+            std::cout << "用户 " << hdr.name << " 登录成功（槽位 " << *index << "）\n";
+        } else {
+            std::cout << "用户 " << hdr.name << " 登录失败（错误码 " << ret << "）\n";
+        }
+    }  // 解锁
+
+    if (success) {
         const char* msg = "login success\n";
         resp.data_len = std::strlen(msg);
-        std::cout << "用户 " << hdr.name << " 登录成功（槽位 " << *index << "）\n";
-
-        // 先发送登录成功响应
+        // 先发送登录成功响应（锁外）
         if (!send_message(sockfd, resp, msg))
             perror("发送登录响应失败");
 
-        // 通知所有在线用户：xxx 上线了
+        // 通知所有在线用户（锁外）
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "%s 上线", online[*index].name);
+        std::snprintf(buf, sizeof(buf), "%s 上线", hdr.name);
         broadcast_system_msg(buf);
     } else {
-        // 将错误码直接透传给客户端
-        resp.state = ret;
-        std::cout << "用户 " << hdr.name << " 登录失败（错误码 " << ret << "）\n";
         if (!send_message(sockfd, resp))
             perror("发送登录失败响应");
     }
@@ -230,6 +214,7 @@ void handle_login(int sockfd, int* index, const Protocol& hdr,
 // @brief  处理公聊命令（BROADCAST）。
 //
 // 将消息格式化为 "发送者: 内容"，然后发送给所有在线用户（排除发送者本人）。
+// 持共享锁拷贝 fd 列表，解锁后发送（锁内不做 I/O）。
 //
 // @param  sender_index  发送者在 online[] 中的下标。
 // @param  hdr           请求头部。
@@ -237,23 +222,35 @@ void handle_login(int sockfd, int* index, const Protocol& hdr,
 //
 void handle_broadcast(int sender_index, const Protocol& hdr,
                       const std::string& data) {
-    // 格式化消息：发送者名 + 消息内容
+    // 格式化消息
     char buf[MAX_DATA_LEN];
-    int len = std::snprintf(buf, sizeof(buf), "%s: %s",
+    int len;
+    {
+        std::shared_lock lock(online_mutex);
+        len = std::snprintf(buf, sizeof(buf), "%s: %s",
                             online[sender_index].name, data.c_str());
+    }
 
     Protocol out{};
     out.data_len = len;
     std::cout << "广播 [" << buf << "]\n";
 
-    // 发送给所有在线用户，排除发送者本人
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        if (online[i].fd == -1 || i == sender_index)
-            continue;
-        if (!send_message(online[i].fd, out, buf)) {
-            // 发送失败 → 对端已死 → 立即清理
-            close(online[i].fd);
-            del_user_online(i);
+    // 持锁拷贝在线用户 fd 列表（排除发送者）
+    std::vector<std::pair<int, int>> targets;  // (fd, index)
+    {
+        std::shared_lock lock(online_mutex);
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].fd == -1 || i == sender_index)
+                continue;
+            targets.push_back({online[i].fd, i});
+        }
+    }
+
+    // 锁外发送，失败时清理
+    for (auto& [fd, idx] : targets) {
+        if (!send_message(fd, out, buf)) {
+            close(fd);
+            del_user_online(idx);
         }
     }
 }
@@ -270,29 +267,49 @@ void handle_broadcast(int sender_index, const Protocol& hdr,
 //
 void handle_private(int sender_index, const Protocol& hdr,
                     const std::string& data) {
-    // 查找目标用户（必须在线）
-    int target = find_user_by_name(hdr.name);
+    // 持锁查找目标 + 获取发送者信息
+    int target = -1;
+    int sender_fd = -1;
+    char sender_name[32] = {};
+    char target_name[32] = {};
+    {
+        std::shared_lock lock(online_mutex);
+        target = find_user_by_name(hdr.name);
+        sender_fd = online[sender_index].fd;
+        std::strncpy(sender_name, online[sender_index].name, sizeof(sender_name) - 1);
+        if (target >= 0)
+            std::strncpy(target_name, online[target].name, sizeof(target_name) - 1);
+    }
+
     if (target == -1) {
         // 目标不存在或不在线 — 通知发送者
         char buf[128];
         int len = std::snprintf(buf, sizeof(buf), "用户 %s 不存在或不在线", hdr.name);
         Protocol resp{};
         resp.data_len = len;
-        if (!send_message(online[sender_index].fd, resp, buf))
+        if (!send_message(sender_fd, resp, buf))
             perror("发送私聊错误通知失败");
-        std::cout << "私聊失败：" << online[sender_index].name
+        std::cout << "私聊失败：" << sender_name
                   << " → " << hdr.name << "（目标不在线）\n";
         return;
     }
 
-    // 格式化并投递到目标用户
+    // 格式化并投递到目标用户（锁外）
     char buf[MAX_DATA_LEN];
     int len = std::snprintf(buf, sizeof(buf), "%s say to %s: %s",
-                            online[sender_index].name, online[target].name,
-                            data.c_str());
+                            sender_name, target_name, data.c_str());
     Protocol out{};
     out.data_len = len;
-    if (!send_message(online[target].fd, out, buf))
+
+    // 持锁获取目标 fd
+    int target_fd = -1;
+    {
+        std::shared_lock lock(online_mutex);
+        if (target < MAX_USER_NUM)
+            target_fd = online[target].fd;
+    }
+
+    if (target_fd >= 0 && !send_message(target_fd, out, buf))
         perror("发送私聊失败");
     std::cout << "私聊 [" << buf << "]\n";
 }
@@ -300,62 +317,84 @@ void handle_private(int sender_index, const Protocol& hdr,
 //
 // @brief  处理在线用户列表命令（ONLINEUSER）。
 //
-// 遍历所有在线用户，逐个发送 ONLINEUSER_OK（含用户名），
-// 最后发送 ONLINEUSER_OVER 标记列表结束。
+// 持共享锁遍历 + 按需拷贝用户名和 fd，解锁后发送。
 //
 // @param  requester_index  请求者在 online[] 中的下标。
 //
 void handle_online_users(int requester_index) {
+    // 持锁获取请求方 fd 和在线用户名列表
+    int requester_fd = -1;
+    std::vector<std::string> names;
+    {
+        std::shared_lock lock(online_mutex);
+        requester_fd = online[requester_index].fd;
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].fd != -1)
+                names.push_back(online[i].name);
+        }
+    }
+
+    // 锁外发送
     Protocol out{};
     out.cmd = ONLINEUSER;
 
-    // 逐个发送在线用户名
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        if (online[i].fd == -1)
-            continue;
+    for (const auto& name : names) {
         out.state = ONLINEUSER_OK;
-        std::strncpy(out.name, online[i].name, sizeof(out.name) - 1);
-        if (!send_message(online[requester_index].fd, out)) {
+        std::strncpy(out.name, name.c_str(), sizeof(out.name) - 1);
+        if (!send_message(requester_fd, out)) {
             perror("发送在线列表失败");
-            return;  // 请求方可能已断开，停止发送
+            return;
         }
     }
 
     // 发送列表结束标记
     out.state = ONLINEUSER_OVER;
     out.name[0] = '\0';
-    if (!send_message(online[requester_index].fd, out))
+    if (!send_message(requester_fd, out))
         perror("发送在线列表结束标记失败");
 
-    std::cout << "在线用户列表已发送给 " << online[requester_index].name << '\n';
+    // 持锁获取日志用名称
+    {
+        std::shared_lock lock(online_mutex);
+        std::cout << "在线用户列表已发送给 " << online[requester_index].name << '\n';
+    }
 }
 
 //
 // @brief  将用户标记为离线，并通知所有在线用户。
 //
+// 持独占锁标记离线，解锁后发送通知。
+//
 // @param  index  在 online[] 中的下标。
 //
 void del_user_online(int index) {
-    // 边界检查：防止越界访问
     if (index < 0 || index >= MAX_USER_NUM)
         return;
 
-    std::cout << online[index].name << " 离线\n";
-
-    // 构建离线通知文本
+    // 持锁标记离线 + 构建通知文本
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%s 离线", online[index].name);
+    {
+        std::unique_lock lock(online_mutex);
+        std::cout << online[index].name << " 离线\n";
+        std::snprintf(buf, sizeof(buf), "%s 离线", online[index].name);
+        online[index].fd = -1;
+    }
 
-    // 先标记离线，排除自身，再内联发送通知（避免递归调用 broadcast_system_msg）
-    online[index].fd = -1;
+    // 持锁拷贝 fd 列表
+    std::vector<int> fds;
+    {
+        std::shared_lock lock(online_mutex);
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].fd != -1)
+                fds.push_back(online[i].fd);
+        }
+    }
 
+    // 锁外发送离线通知
     Protocol hdr{};
     hdr.data_len = std::strlen(buf);
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        if (online[i].fd == -1)
-            continue;
-        send_message(online[i].fd, hdr, buf);
-    }
+    for (int fd : fds)
+        send_message(fd, hdr, buf);
 }
 
 // ---------- 客户端处理线程 ----------
@@ -394,7 +433,7 @@ void client_handler(int client_fd, const std::string& client_ip) {
                 break;
         }
 
-        // 已登录用户：任何收到的数据包都刷新活跃时间
+        // 已登录用户：任何收到的数据包都刷新活跃时间（atomic，无需锁）
         if (index >= 0)
             online[index].last_active = time(nullptr);
 
@@ -416,15 +455,13 @@ void client_handler(int client_fd, const std::string& client_ip) {
             handle_online_users(index);
             break;
         case HEARTBEAT:
-            // PONG 已通过上方的 last_active 刷新处理，
-            // 客户端发来的 PING 直接忽略即可
             break;
         default:
             break;
         }
     }
 
-    // 线程退出前清理：如果该客户端已登录，标记为离线并通知其他人
+    // 线程退出前清理
     del_user_online(index);
     close(client_fd);
 }
@@ -434,9 +471,7 @@ void client_handler(int client_fd, const std::string& client_ip) {
 //
 // @brief  watchdog 线程，定期检测死连接。
 //
-// 每 WATCHDOG_TICK 秒检查所有在线用户：
-// - 空闲 > PING_INTERVAL：发送 PING 探测
-// - 空闲 > TIMEOUT：判定为死连接，强制关闭并通知其他用户
+// 持独占锁遍历收集待处理动作，解锁后执行（锁内不做 I/O）。
 //
 void watchdog_loop() {
     while (true) {
@@ -444,24 +479,38 @@ void watchdog_loop() {
 
         time_t now = time(nullptr);
 
-        for (int i = 0; i < MAX_USER_NUM; ++i) {
-            if (online[i].fd == -1)
-                continue;
+        // 持锁遍历，收集需要处理的用户
+        std::vector<int> timeout_users;  // 需要强制下线的用户 index
+        std::vector<int> ping_users;     // 需要发 PING 的用户 fd
 
-            time_t idle = now - online[i].last_active.load();
+        {
+            std::unique_lock lock(online_mutex);
+            for (int i = 0; i < MAX_USER_NUM; ++i) {
+                if (online[i].fd == -1)
+                    continue;
 
-            if (idle >= TIMEOUT) {
-                // 超时未响应 — 强制断开
-                std::cout << "心跳超时: " << online[i].name << " 已强制下线\n";
-                close(online[i].fd);
-                del_user_online(i);
-            } else if (idle >= PING_INTERVAL) {
-                // 空闲超过 PING 间隔 — 发送 PING
-                Protocol ping{};
-                ping.cmd = HEARTBEAT;
-                ping.state = PING;
-                send_message(online[i].fd, ping);  // 失败不影响，watchdog 下次自行超时处理
+                time_t idle = now - online[i].last_active.load();
+
+                if (idle >= TIMEOUT) {
+                    timeout_users.push_back(i);
+                } else if (idle >= PING_INTERVAL) {
+                    ping_users.push_back(online[i].fd);
+                }
             }
+        }  // 解锁
+
+        // 锁外执行：发 PING
+        Protocol ping{};
+        ping.cmd = HEARTBEAT;
+        ping.state = PING;
+        for (int fd : ping_users)
+            send_message(fd, ping);
+
+        // 锁外执行：强制下线（del_user_online 自身会加锁）
+        for (int idx : timeout_users) {
+            std::cout << "心跳超时: " << online[idx].name << " 已强制下线\n";
+            close(online[idx].fd);
+            del_user_online(idx);
         }
     }
 }
@@ -470,16 +519,9 @@ void watchdog_loop() {
 
 namespace {
 
-// 由信号处理函数和主循环共享
 volatile sig_atomic_t g_shutdown = 0;
 int                    g_listen_fd = -1;
 
-//
-// @brief  SIGINT / SIGTERM 信号处理函数。
-//
-// 设置关闭标志并关闭监听 socket，使 accept() 返回错误，
-// 主循环检测到 g_shutdown 后进入关闭流程。
-//
 void handle_signal(int /*sig*/) {
     g_shutdown = 1;
     if (g_listen_fd >= 0)
@@ -497,7 +539,6 @@ void handle_signal(int /*sig*/) {
 // @return 0 正常退出，1 出错。
 //
 int main(int argc, char* argv[]) {
-    // 参数校验
     if (argc != 2) {
         std::cerr << "用法: " << argv[0] << " port\n";
         return 1;
@@ -523,7 +564,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 绑定到所有网卡接口的指定端口
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -535,7 +575,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 开始监听（backlog = 10）
     if (listen(listen_sock.get(), 10) == -1) {
         perror("listen");
         return 1;
@@ -543,17 +582,14 @@ int main(int argc, char* argv[]) {
 
     std::cout << "服务器正在监听端口 " << port << '\n';
 
-    // 保存 listen_fd 供信号处理函数使用
     g_listen_fd = listen_sock.get();
 
-    // 注册信号处理函数
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    // 启动心跳 watchdog 线程
     std::thread(watchdog_loop).detach();
 
-    // 主循环：阻塞等待客户端连接
+    // 主循环
     while (!g_shutdown) {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
@@ -562,41 +598,37 @@ int main(int argc, char* argv[]) {
             accept(listen_sock.get(), reinterpret_cast<sockaddr*>(&client_addr),
                    &addr_len);
         if (client_fd == -1) {
-            // g_shutdown 为真时 accept 因 listen_fd 被 close 而返回错误
             if (g_shutdown)
                 break;
             perror("accept");
             continue;
         }
 
-        // 解析客户端 IP 用于日志
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         std::cout << "客户端已连接: " << client_ip << '\n';
 
-        // 每个客户端在独立线程中处理（detach 方式）
         std::thread(client_handler, client_fd, std::string(client_ip)).detach();
     }
 
-    // ======== 优雅关闭流程 ========
-
+    // 优雅关闭
     std::cout << "\n正在关闭服务器...\n";
 
-    // 1. 通知所有在线用户
     const char* shutdown_msg = "服务器正在关闭";
     Protocol hdr{};
     hdr.data_len = std::strlen(shutdown_msg);
-    for (int i = 0; i < MAX_USER_NUM; ++i) {
-        if (online[i].fd != -1) {
-            send_message(online[i].fd, hdr, shutdown_msg);
-            close(online[i].fd);
-            online[i].fd = -1;
+    {
+        std::unique_lock lock(online_mutex);
+        for (int i = 0; i < MAX_USER_NUM; ++i) {
+            if (online[i].fd != -1) {
+                send_message(online[i].fd, hdr, shutdown_msg);
+                close(online[i].fd);
+                online[i].fd = -1;
+            }
         }
     }
 
-    // 2. 等待 client_handler 线程退出
     std::this_thread::sleep_for(std::chrono::seconds(1));
-
     std::cout << "服务器已关闭，再见。\n";
     return 0;
 }
