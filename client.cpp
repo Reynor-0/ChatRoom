@@ -1,17 +1,17 @@
 //
 // client.cpp
-// TCP Chatroom Client — connects to the chatroom server, provides an
-// interactive menu for registration, login, and (in future phases)
-// chat functionality.
+// TCP 聊天室客户端 — 连接到聊天室服务器，提供交互式菜单，
+// 支持注册、登录、公聊、私聊、在线用户列表。
+// 使用长度前缀分帧协议通信。
 //
-// Usage:
+// 用法：
 //   compile:  cmake -B build && cmake --build build
 //   run:      ./build/client <host> <port>
 //   example:  ./build/client 127.0.0.1 8888
 //
-// Menu flow:
-//   Not logged in → [1.Register] [2.Login] [0.Exit]
-//   Logged in     → [3.Broadcast] [4.Private] [5.Online Users] [0.Logout]
+// 菜单流程：
+//   未登录 → [1.注册] [2.登录] [0.退出]
+//   已登录 → [3.公聊] [4.私聊] [5.在线用户] [0.登出]
 //
 
 #include "socket.h"
@@ -29,114 +29,158 @@
 #include <string>
 #include <thread>
 
-// ---------- Global connection state ----------
+// ---------- 全局连接状态 ----------
 
 namespace {
 
-int  sockfd  = -1;        // server connection
-int  login_f = -1;        // -1 = not logged in, 1 = logged in
+int  sockfd  = -1;        // 与服务器的连接 socket
+int  login_f = -1;        // -1：未登录，1：已登录
 
 }  // namespace
 
-// ---------- Background receive thread ----------
+// ---------- 后台接收线程 ----------
 
 //
-// @brief  Background thread that receives server messages.
+// @brief  后台线程，负责接收服务器发来的消息。
 //
-// Runs for the lifetime of the client. While not logged in it sleeps
-// briefly; once logged in it reads Protocol structs and prints
-// the data field (used for broadcasts, system messages, etc.).
+// 登录后持续运行。根据 cmd 和 state 区分消息类型：
+// - ONLINEUSER_OK：同行打印用户名（tab 分隔）
+// - ONLINEUSER_OVER：打印换行，列表结束
+// - 其他消息：打印载荷内容
 //
 void recv_loop() {
     while (true) {
-        // Wait until the user is logged in before reading from the socket.
-        // During register/login the main thread handles socket I/O directly.
+        // 等待用户登录后才开始读取 socket。
         if (login_f != 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
 
-        Protocol msg{};
-        int n = recv(sockfd, &msg, sizeof(msg), 0);
-        if (n <= 0) {
-            std::cout << "\n[Disconnected from server]\n";
+        // 先读取固定大小头部
+        Protocol hdr{};
+        if (recv_all(sockfd, &hdr, sizeof(hdr)) <= 0) {
+            std::cout << "\n[与服务器断开连接]\n";
             login_f = -1;
             return;
         }
 
-        if (static_cast<size_t>(n) < sizeof(msg))
+        // 安全检查
+        if (hdr.data_len < 0 || hdr.data_len > MAX_DATA_LEN)
             continue;
 
-        // Print the server message (data field carries text for now)
-        if (msg.data[0] != '\0')
-            std::cout << msg.data << '\n';
+        // 按声明的长度读取载荷
+        std::string data(hdr.data_len, '\0');
+        if (hdr.data_len > 0) {
+            if (recv_all(sockfd, data.data(), hdr.data_len) <= 0) {
+                std::cout << "\n[与服务器断开连接]\n";
+                login_f = -1;
+                return;
+            }
+        }
+
+        // 心跳 PING — 自动回复 PONG，对用户透明
+        if (hdr.cmd == HEARTBEAT && hdr.state == PING) {
+            Protocol pong{};
+            pong.cmd = HEARTBEAT;
+            pong.state = PONG;
+            send_message(sockfd, pong);
+            continue;
+        }
+
+        // 在线用户列表响应 — 特殊显示格式
+        if (hdr.cmd == ONLINEUSER) {
+            if (hdr.state == ONLINEUSER_OK) {
+                // 每个用户名同行显示，用 tab 分隔
+                std::cout << hdr.name << "\t";
+            } else if (hdr.state == ONLINEUSER_OVER) {
+                // 列表结束，换行
+                std::cout << "\n";
+            }
+            continue;
+        }
+
+        // 普通聊天消息、系统通知 — 直接打印载荷内容
+        if (!data.empty())
+            std::cout << data << '\n';
     }
 }
 
-// ---------- User actions ----------
+// ---------- 用户操作 ----------
 
 //
-// @brief  Register a new account.
+// @brief  注册新账号。
 //
-// Prompts for username and password, sends a REGISTE command,
-// and prints the server's response.
+// 提示输入用户名和密码，密码作为载荷发送。
 //
 void do_register() {
-    Protocol msg{};
-    msg.cmd = REGISTE;
+    Protocol hdr{};
+    hdr.cmd = REGISTE;
 
-    std::cout << "Username: ";
-    std::cin >> msg.name;
-    std::cout << "Password: ";
-    std::cin >> msg.data;
+    std::string password;
+    std::cout << "用户名: ";
+    std::cin >> hdr.name;
+    std::cout << "密码: ";
+    std::cin >> password;
 
-    send(sockfd, &msg, sizeof(msg), 0);
+    hdr.data_len = password.size();
+    send_message(sockfd, hdr, password.data());
 
+    // 等待服务器返回注册结果（仅头部，无载荷）
     Protocol resp{};
-    recv(sockfd, &resp, sizeof(resp), 0);
+    if (recv_all(sockfd, &resp, sizeof(resp)) <= 0)
+        return;
 
     if (resp.state == OP_OK)
-        std::cout << "[Registration successful]\n";
+        std::cout << "[注册成功]\n";
     else if (resp.state == NAME_EXIST)
-        std::cout << "[Username already exists]\n";
+        std::cout << "[用户名已存在]\n";
 
     std::cin.ignore(1024, '\n');
     std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
 //
-// @brief  Login with existing credentials.
+// @brief  使用已有账号登录。
 //
-// Prompts for username and password, sends a LOGIN command,
-// and updates the global login_f state on success.
+// 提示输入用户名和密码，密码作为载荷发送。
 //
 void do_login() {
-    Protocol msg{};
-    msg.cmd = LOGIN;
+    Protocol hdr{};
+    hdr.cmd = LOGIN;
 
-    std::cout << "Username: ";
-    std::cin >> msg.name;
-    std::cout << "Password: ";
-    std::cin >> msg.data;
+    std::string password;
+    std::cout << "用户名: ";
+    std::cin >> hdr.name;
+    std::cout << "密码: ";
+    std::cin >> password;
 
-    send(sockfd, &msg, sizeof(msg), 0);
+    hdr.data_len = password.size();
+    send_message(sockfd, hdr, password.data());
 
+    // 等待服务器返回登录结果
     Protocol resp{};
-    recv(sockfd, &resp, sizeof(resp), 0);
+    if (recv_all(sockfd, &resp, sizeof(resp)) <= 0)
+        return;
 
+    // 如果响应带有载荷（如 "login success\n"），读取后丢弃（仅日志用）
+    std::string data(resp.data_len, '\0');
+    if (resp.data_len > 0 && resp.data_len <= MAX_DATA_LEN)
+        recv_all(sockfd, data.data(), resp.data_len);
+
+    // 根据返回码处理不同情况
     switch (resp.state) {
     case OP_OK:
-        std::cout << "[Login successful]\n";
-        login_f = 1;
+        std::cout << "[登录成功]\n";
+        login_f = 1;          // 切换为已登录状态，后续菜单展示聊天选项
         break;
     case NAME_PWD_NMATCH:
-        std::cout << "[Wrong username or password]\n";
+        std::cout << "[用户名或密码错误]\n";
         break;
     case USER_LOGED:
-        std::cout << "[User already logged in]\n";
+        std::cout << "[该用户已在线]\n";
         break;
     default:
-        std::cout << "[Login failed, code: " << resp.state << "]\n";
+        std::cout << "[登录失败，错误码: " << resp.state << "]\n";
         break;
     }
 
@@ -145,63 +189,116 @@ void do_login() {
 }
 
 //
-// @brief  Logout and return to the login/register menu.
+// @brief  发送公聊消息。
+//
+// 消息内容作为载荷发送（支持空格、超长文本）。
+//
+void do_broadcast() {
+    Protocol hdr{};
+    hdr.cmd = BROADCAST;
+
+    std::cout << "消息: ";
+    std::cin.ignore(1024, '\n');
+    std::string msg;
+    std::getline(std::cin, msg);
+
+    hdr.data_len = msg.size();
+    send_message(sockfd, hdr, msg.data());
+}
+
+//
+// @brief  发送私聊消息。
+//
+// 目标用户名放在头部 name 字段，消息内容作为载荷发送。
+//
+void do_private() {
+    Protocol hdr{};
+    hdr.cmd = PRIVATE;
+
+    std::cout << "发送给: ";
+    std::cin.ignore(1024, '\n');
+    std::cin.getline(hdr.name, sizeof(hdr.name) - 1);
+
+    std::cout << "消息: ";
+    std::string msg;
+    std::getline(std::cin, msg);
+
+    hdr.data_len = msg.size();
+    send_message(sockfd, hdr, msg.data());
+}
+
+//
+// @brief  请求在线用户列表。
+//
+// 发送 ONLINEUSER 命令（无载荷），接收由后台 recv_loop 处理。
+//
+void do_list_online() {
+    Protocol hdr{};
+    hdr.cmd = ONLINEUSER;
+
+    send_message(sockfd, hdr);
+    // 等待 recv_loop 接收并打印列表
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+}
+
+//
+// @brief  登出并返回登录/注册菜单。
 //
 void do_logout() {
-    // Close the socket to signal server
     close(sockfd);
     sockfd = -1;
     login_f = -1;
 }
 
-// ---------- Menu display ----------
+// ---------- 菜单显示 ----------
 
 //
-// @brief  Display the menu for not-logged-in users.
+// @brief  显示未登录状态的菜单。
 //
 void show_login_menu() {
-    std::cout << "\n========== Chatroom ==========\n";
-    std::cout << "  1. Register\n";
-    std::cout << "  2. Login\n";
-    std::cout << "  0. Exit\n";
-    std::cout << "==============================\n";
-    std::cout << "Choice: ";
+    std::cout << "\n========== 聊天室 ==========\n";
+    std::cout << "  1. 注册\n";
+    std::cout << "  2. 登录\n";
+    std::cout << "  0. 退出\n";
+    std::cout << "============================\n";
+    std::cout << "选择: ";
 }
 
 //
-// @brief  Display the menu for logged-in users.
+// @brief  显示已登录状态的菜单。
 //
 void show_chat_menu() {
-    std::cout << "\n========== Chatroom ==========\n";
-    std::cout << "  3. Broadcast\n";
-    std::cout << "  4. Private message\n";
-    std::cout << "  5. Online users\n";
-    std::cout << "  0. Logout\n";
-    std::cout << "==============================\n";
-    std::cout << "Choice: ";
+    std::cout << "\n========== 聊天室 ==========\n";
+    std::cout << "  3. 公聊\n";
+    std::cout << "  4. 私聊\n";
+    std::cout << "  5. 在线用户\n";
+    std::cout << "  0. 登出\n";
+    std::cout << "============================\n";
+    std::cout << "选择: ";
 }
 
-// ---------- Entry point ----------
+// ---------- 入口 ----------
 
 //
-// @brief  Entry point for the chatroom client.
-// @param  argc  Argument count (expected: 3).
-// @param  argv  Argument vector — argv[1] is server IP, argv[2] is port.
-// @return 0 on clean exit, 1 on error.
+// @brief  聊天室客户端入口。
+// @param  argc  参数个数（预期为 3）。
+// @param  argv  参数数组 — argv[1] 服务器 IP，argv[2] 端口号。
+// @return 0 正常退出，1 出错。
 //
 int main(int argc, char* argv[]) {
+    // 参数校验
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " host port\n";
+        std::cerr << "用法: " << argv[0] << " host port\n";
         return 1;
     }
 
     int port = std::atoi(argv[2]);
     if (port <= 0) {
-        std::cerr << "Usage: " << argv[0] << " host port\n";
+        std::cerr << "用法: " << argv[0] << " host port\n";
         return 1;
     }
 
-    // Create socket and connect to server
+    // 创建 socket 并连接服务器
     ScopedSocket sock(socket(AF_INET, SOCK_STREAM, 0));
     if (sock.get() == -1) {
         perror("socket");
@@ -212,7 +309,7 @@ int main(int argc, char* argv[]) {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     if (inet_pton(AF_INET, argv[1], &server_addr.sin_addr) != 1) {
-        std::cerr << "Invalid address: " << argv[1] << '\n';
+        std::cerr << "无效地址: " << argv[1] << '\n';
         return 1;
     }
 
@@ -223,14 +320,15 @@ int main(int argc, char* argv[]) {
     }
 
     sockfd = sock.get();
-    std::cout << "Connected to " << argv[1] << ':' << port << '\n';
+    std::cout << "已连接到 " << argv[1] << ':' << port << '\n';
 
-    // Start the background receive thread (activates after login)
+    // 启动后台接收线程（登录后生效）
     std::thread recv_thread(recv_loop);
     recv_thread.detach();
 
-    // Menu loop
+    // 主菜单循环
     while (true) {
+        // 根据登录状态显示不同的菜单
         if (login_f == -1)
             show_login_menu();
         else
@@ -240,10 +338,10 @@ int main(int argc, char* argv[]) {
         std::cin >> sel;
 
         if (!std::cin) {
-            // EOF — clean exit
+            // 收到 EOF（Ctrl+D），正常退出
             if (std::cin.eof())
                 break;
-            // Non-numeric input — skip and retry
+            // 非数字输入 — 清空并重试
             std::cin.clear();
             std::cin.ignore(1024, '\n');
             continue;
@@ -251,17 +349,19 @@ int main(int argc, char* argv[]) {
 
         if (sel == 0) {
             if (login_f == 1) {
+                // 已登录状态：0 表示登出
                 do_logout();
             } else {
-                break;  // exit
+                // 未登录状态：0 表示退出程序
+                break;
             }
             continue;
         }
 
+        // 未登录时仅允许 1（注册）和 2（登录）
         if (login_f == -1) {
-            // Not logged in: only 1 and 2 are valid
             if (sel < 1 || sel > 2) {
-                std::cout << "[Invalid choice]\n";
+                std::cout << "[无效选项]\n";
                 continue;
             }
             if (sel == 1)
@@ -269,24 +369,20 @@ int main(int argc, char* argv[]) {
             else
                 do_login();
         } else {
-            // Logged in: 3, 4, 5 are valid
+            // 已登录时仅允许 3（公聊）、4（私聊）、5（在线用户）
             if (sel < 3 || sel > 5) {
-                std::cout << "[Invalid choice]\n";
+                std::cout << "[无效选项]\n";
                 continue;
             }
-            // Phase 3+ will implement these
             switch (sel) {
             case 3:
-                std::cout << "[Broadcast — coming in Phase 3]\n";
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                do_broadcast();
                 break;
             case 4:
-                std::cout << "[Private message — coming in Phase 3]\n";
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                do_private();
                 break;
             case 5:
-                std::cout << "[Online users — coming in Phase 3]\n";
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                do_list_online();
                 break;
             }
         }
