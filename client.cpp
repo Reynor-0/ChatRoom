@@ -22,7 +22,9 @@
 #include <sys/socket.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -35,6 +37,9 @@ namespace {
 
 int  sockfd  = -1;        // 与服务器的连接 socket
 int  login_f = -1;        // -1：未登录，1：已登录
+
+std::mutex              login_mtx;
+std::condition_variable login_cv;
 
 }  // namespace
 
@@ -52,8 +57,8 @@ void recv_loop() {
     while (true) {
         // 等待用户登录后才开始读取 socket。
         if (login_f != 1) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
+            std::unique_lock lock(login_mtx);
+            login_cv.wait(lock, [] { return login_f == 1; });
         }
 
         // 先读取固定大小头部
@@ -181,7 +186,8 @@ void do_login() {
     switch (resp.state) {
     case OP_OK:
         std::cout << "[登录成功]\n";
-        login_f = 1;          // 切换为已登录状态，后续菜单展示聊天选项
+        login_f = 1;          // 切换为已登录状态，唤醒 recv_loop
+        login_cv.notify_one();
         break;
     case NAME_PWD_NMATCH:
         std::cout << "[用户名或密码错误]\n";
