@@ -146,11 +146,8 @@ void broadcast_system_msg(const char* text) {
     for (int i = 0; i < MAX_USER_NUM; ++i) {
         if (online[i].fd == -1)
             continue;
-        if (!send_message(online[i].fd, hdr, text)) {
-            // 发送失败 → 对端已死 → 立即清理
-            close(online[i].fd);
-            del_user_online(i);
-        }
+        // 纯发送，失败不清理 — 死连接由 handle_broadcast 或 watchdog 处理
+        send_message(online[i].fd, hdr, text);
     }
 }
 
@@ -345,11 +342,20 @@ void del_user_online(int index) {
 
     std::cout << online[index].name << " 离线\n";
 
-    // 先重置 fd（排除该用户），再广播离线通知
+    // 构建离线通知文本
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%s 离线", online[index].name);
+
+    // 先标记离线，排除自身，再内联发送通知（避免递归调用 broadcast_system_msg）
     online[index].fd = -1;
-    broadcast_system_msg(buf);
+
+    Protocol hdr{};
+    hdr.data_len = std::strlen(buf);
+    for (int i = 0; i < MAX_USER_NUM; ++i) {
+        if (online[i].fd == -1)
+            continue;
+        send_message(online[i].fd, hdr, buf);
+    }
 }
 
 // ---------- 客户端处理线程 ----------
