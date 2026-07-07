@@ -44,6 +44,20 @@ public:
     //
     int get() const { return fd_; }
 
+    //
+    // @brief  放弃 fd 所有权并返回原始文件描述符。
+    //
+    // 调用后 ScopedSocket 不再拥有该 fd，析构时不会 close。
+    // 调用者负责管理 fd 的关闭。
+    //
+    // @return 持有的 fd。
+    //
+    int release() {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
 private:
     int fd_;
 };

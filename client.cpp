@@ -332,7 +332,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    sockfd = sock.get();
+    sockfd = sock.release();  // 转移所有权给全局变量，ScopedSocket 不再管理
     std::cout << "已连接到 " << argv[1] << ':' << port << '\n';
 
     // 启动后台接收线程（登录后生效）
