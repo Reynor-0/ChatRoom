@@ -83,7 +83,11 @@ void recv_loop() {
             Protocol pong{};
             pong.cmd = HEARTBEAT;
             pong.state = PONG;
-            send_message(sockfd, pong);
+            if (!send_message(sockfd, pong)) {
+                std::cout << "\n[与服务器断开连接]\n";
+                login_f = -1;
+                return;
+            }
             continue;
         }
 
@@ -123,7 +127,10 @@ void do_register() {
     std::cin >> password;
 
     hdr.data_len = password.size();
-    send_message(sockfd, hdr, password.data());
+    if (!send_message(sockfd, hdr, password.data())) {
+        std::cout << "[发送失败，请检查连接]\n";
+        return;
+    }
 
     // 等待服务器返回注册结果（仅头部，无载荷）
     Protocol resp{};
@@ -155,7 +162,10 @@ void do_login() {
     std::cin >> password;
 
     hdr.data_len = password.size();
-    send_message(sockfd, hdr, password.data());
+    if (!send_message(sockfd, hdr, password.data())) {
+        std::cout << "[发送失败，请检查连接]\n";
+        return;
+    }
 
     // 等待服务器返回登录结果
     Protocol resp{};
@@ -203,7 +213,8 @@ void do_broadcast() {
     std::getline(std::cin, msg);
 
     hdr.data_len = msg.size();
-    send_message(sockfd, hdr, msg.data());
+    if (!send_message(sockfd, hdr, msg.data()))
+        std::cout << "[发送失败]\n";
 }
 
 //
@@ -224,7 +235,8 @@ void do_private() {
     std::getline(std::cin, msg);
 
     hdr.data_len = msg.size();
-    send_message(sockfd, hdr, msg.data());
+    if (!send_message(sockfd, hdr, msg.data()))
+        std::cout << "[发送失败]\n";
 }
 
 //
@@ -236,7 +248,8 @@ void do_list_online() {
     Protocol hdr{};
     hdr.cmd = ONLINEUSER;
 
-    send_message(sockfd, hdr);
+    if (!send_message(sockfd, hdr))
+        std::cout << "[发送失败]\n";
     // 等待 recv_loop 接收并打印列表
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }

@@ -123,12 +123,18 @@ inline int recv_all(int fd, void* buf, int len) {
 // @param  fd       socket 文件描述符。
 // @param  header   已填充的协议头部（data_len 必须已设置）。
 // @param  data     载荷数据指针，data_len 为 0 时可为 nullptr。
+// @return true 全部字节发送成功，false 发送失败（对端可能已断开）。
 //
-inline void send_message(int fd, const Protocol& header, const void* data = nullptr) {
+inline bool send_message(int fd, const Protocol& header, const void* data = nullptr) {
     // MSG_NOSIGNAL 避免向已关闭的 socket 写入时触发 SIGPIPE
-    send(fd, &header, sizeof(header), MSG_NOSIGNAL);
-    if (header.data_len > 0 && data != nullptr)
-        send(fd, data, header.data_len, MSG_NOSIGNAL);
+    if (send(fd, &header, sizeof(header), MSG_NOSIGNAL) !=
+        static_cast<ssize_t>(sizeof(header)))
+        return false;
+    if (header.data_len > 0 && data != nullptr) {
+        if (send(fd, data, header.data_len, MSG_NOSIGNAL) != header.data_len)
+            return false;
+    }
+    return true;
 }
 
 //

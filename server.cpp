@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 
 #include <array>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -126,6 +127,9 @@ int add_user(const char* username, const char* password) {
     return -1;
 }
 
+// 前置声明
+void del_user_online(int index);
+
 // ---------- 系统通知广播 ----------
 
 //
@@ -140,8 +144,13 @@ void broadcast_system_msg(const char* text) {
     hdr.data_len = std::strlen(text);
 
     for (int i = 0; i < MAX_USER_NUM; ++i) {
-        if (online[i].fd != -1)
-            send_message(online[i].fd, hdr, text);
+        if (online[i].fd == -1)
+            continue;
+        if (!send_message(online[i].fd, hdr, text)) {
+            // 发送失败 → 对端已死 → 立即清理
+            close(online[i].fd);
+            del_user_online(i);
+        }
     }
 }
 
@@ -175,7 +184,8 @@ void handle_register(int sockfd, int* index, const Protocol& hdr,
         std::cout << "用户 " << hdr.name << " 已存在\n";
     }
 
-    send_message(sockfd, resp);
+    if (!send_message(sockfd, resp))
+        perror("发送注册响应失败");
 }
 
 //
@@ -203,7 +213,8 @@ void handle_login(int sockfd, int* index, const Protocol& hdr,
         std::cout << "用户 " << hdr.name << " 登录成功（槽位 " << *index << "）\n";
 
         // 先发送登录成功响应
-        send_message(sockfd, resp, msg);
+        if (!send_message(sockfd, resp, msg))
+            perror("发送登录响应失败");
 
         // 通知所有在线用户：xxx 上线了
         char buf[64];
@@ -213,7 +224,8 @@ void handle_login(int sockfd, int* index, const Protocol& hdr,
         // 将错误码直接透传给客户端
         resp.state = ret;
         std::cout << "用户 " << hdr.name << " 登录失败（错误码 " << ret << "）\n";
-        send_message(sockfd, resp);
+        if (!send_message(sockfd, resp))
+            perror("发送登录失败响应");
     }
 }
 
@@ -241,7 +253,11 @@ void handle_broadcast(int sender_index, const Protocol& hdr,
     for (int i = 0; i < MAX_USER_NUM; ++i) {
         if (online[i].fd == -1 || i == sender_index)
             continue;
-        send_message(online[i].fd, out, buf);
+        if (!send_message(online[i].fd, out, buf)) {
+            // 发送失败 → 对端已死 → 立即清理
+            close(online[i].fd);
+            del_user_online(i);
+        }
     }
 }
 
@@ -265,7 +281,8 @@ void handle_private(int sender_index, const Protocol& hdr,
         int len = std::snprintf(buf, sizeof(buf), "用户 %s 不存在或不在线", hdr.name);
         Protocol resp{};
         resp.data_len = len;
-        send_message(online[sender_index].fd, resp, buf);
+        if (!send_message(online[sender_index].fd, resp, buf))
+            perror("发送私聊错误通知失败");
         std::cout << "私聊失败：" << online[sender_index].name
                   << " → " << hdr.name << "（目标不在线）\n";
         return;
@@ -278,7 +295,8 @@ void handle_private(int sender_index, const Protocol& hdr,
                             data.c_str());
     Protocol out{};
     out.data_len = len;
-    send_message(online[target].fd, out, buf);
+    if (!send_message(online[target].fd, out, buf))
+        perror("发送私聊失败");
     std::cout << "私聊 [" << buf << "]\n";
 }
 
@@ -300,13 +318,17 @@ void handle_online_users(int requester_index) {
             continue;
         out.state = ONLINEUSER_OK;
         std::strncpy(out.name, online[i].name, sizeof(out.name) - 1);
-        send_message(online[requester_index].fd, out);
+        if (!send_message(online[requester_index].fd, out)) {
+            perror("发送在线列表失败");
+            return;  // 请求方可能已断开，停止发送
+        }
     }
 
     // 发送列表结束标记
     out.state = ONLINEUSER_OVER;
     out.name[0] = '\0';
-    send_message(online[requester_index].fd, out);
+    if (!send_message(online[requester_index].fd, out))
+        perror("发送在线列表结束标记失败");
 
     std::cout << "在线用户列表已发送给 " << online[requester_index].name << '\n';
 }
@@ -432,11 +454,33 @@ void watchdog_loop() {
                 Protocol ping{};
                 ping.cmd = HEARTBEAT;
                 ping.state = PING;
-                send_message(online[i].fd, ping);
+                send_message(online[i].fd, ping);  // 失败不影响，watchdog 下次自行超时处理
             }
         }
     }
 }
+
+// ---------- 信号处理（优雅关闭） ----------
+
+namespace {
+
+// 由信号处理函数和主循环共享
+volatile sig_atomic_t g_shutdown = 0;
+int                    g_listen_fd = -1;
+
+//
+// @brief  SIGINT / SIGTERM 信号处理函数。
+//
+// 设置关闭标志并关闭监听 socket，使 accept() 返回错误，
+// 主循环检测到 g_shutdown 后进入关闭流程。
+//
+void handle_signal(int /*sig*/) {
+    g_shutdown = 1;
+    if (g_listen_fd >= 0)
+        close(g_listen_fd);
+}
+
+}  // namespace
 
 // ---------- 入口 ----------
 
@@ -493,11 +537,18 @@ int main(int argc, char* argv[]) {
 
     std::cout << "服务器正在监听端口 " << port << '\n';
 
+    // 保存 listen_fd 供信号处理函数使用
+    g_listen_fd = listen_sock.get();
+
+    // 注册信号处理函数
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
     // 启动心跳 watchdog 线程
     std::thread(watchdog_loop).detach();
 
     // 主循环：阻塞等待客户端连接
-    while (true) {
+    while (!g_shutdown) {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
 
@@ -505,6 +556,9 @@ int main(int argc, char* argv[]) {
             accept(listen_sock.get(), reinterpret_cast<sockaddr*>(&client_addr),
                    &addr_len);
         if (client_fd == -1) {
+            // g_shutdown 为真时 accept 因 listen_fd 被 close 而返回错误
+            if (g_shutdown)
+                break;
             perror("accept");
             continue;
         }
@@ -517,4 +571,26 @@ int main(int argc, char* argv[]) {
         // 每个客户端在独立线程中处理（detach 方式）
         std::thread(client_handler, client_fd, std::string(client_ip)).detach();
     }
+
+    // ======== 优雅关闭流程 ========
+
+    std::cout << "\n正在关闭服务器...\n";
+
+    // 1. 通知所有在线用户
+    const char* shutdown_msg = "服务器正在关闭";
+    Protocol hdr{};
+    hdr.data_len = std::strlen(shutdown_msg);
+    for (int i = 0; i < MAX_USER_NUM; ++i) {
+        if (online[i].fd != -1) {
+            send_message(online[i].fd, hdr, shutdown_msg);
+            close(online[i].fd);
+            online[i].fd = -1;
+        }
+    }
+
+    // 2. 等待 client_handler 线程退出
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    std::cout << "服务器已关闭，再见。\n";
+    return 0;
 }
